@@ -1,0 +1,16 @@
+.env
+.wsj-auth.json
+.wsj-browser/
+.wsj-sync.lock
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+logs/
+output_results/*
+database.js
+database.js.bak
+*.bak
+*.backup
+.pytest_cache/
+.DS_Store

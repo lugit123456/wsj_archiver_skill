@@ -1,0 +1,6 @@
+drissionpage>=4.0.0
+requests>=2.31.0
+urllib3<2; python_version < "3.10"
+openai>=1.0.0
+python-dotenv>=1.0.0
+pillow>=11.0.0
