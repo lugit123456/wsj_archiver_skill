@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import sync_wsj
 from sync_wsj import (
     _persist_wsj_state,
+    _migrate_image_description_fields,
     _wsj_text_cover_url,
     acquire_run_lock,
+    deduplicate_article_image_metadata,
     materialize_ereader_images,
+    translate_image_descriptions,
 )
 from wsj_ereader import EReaderImage
 
@@ -166,6 +171,97 @@ class WsjStorageTests(unittest.TestCase):
         self.assertEqual(paths, ["images/local.jpg"])
         self.assertEqual(placements[0]["path"], "images/local.jpg")
         self.assertEqual(placements[0]["caption"], "Caption")
+        self.assertNotIn("caption_zh", placements[0])
+
+    def test_image_captions_are_translated_without_replacing_source_metadata(self) -> None:
+        class Completions:
+            @staticmethod
+            def create(**_kwargs: object) -> object:
+                content = json.dumps({
+                    "captions": [
+                        {"index": 1, "description": "游客在瓦胡岛的威基基海滩游玩。"},
+                        {"index": 2, "description": "左图为乔什·梁在夏威夷凯卢阿的总部。"},
+                    ]
+                }, ensure_ascii=False)
+                return SimpleNamespace(choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=content)
+                )])
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        )
+        placements = [
+            {"path": "images/1.jpg", "caption": "Visitors at Waikiki Beach.", "credit": "PHOTO"},
+            {"path": "images/2.jpg", "caption": "ADITYA SHARMA From left, Josh Leong at headquarters.", "credit": ""},
+            {"path": "images/3.jpg", "caption": "", "credit": "PHOTOGRAPHER"},
+        ]
+        insights = translate_image_descriptions(
+            client,
+            sync_wsj.DEFAULTS,
+            "Hawaii Chases The Startup Wave",
+            placements,
+            [],
+            logging.getLogger("test"),
+        )
+
+        self.assertEqual(insights[0]["path"], "images/1.jpg")
+        self.assertEqual(insights[0]["description"], "游客在瓦胡岛的威基基海滩游玩。")
+        self.assertEqual(insights[1]["description"], "左图为乔什·梁在夏威夷凯卢阿的总部。")
+        self.assertNotIn("caption_zh", placements[0])
+
+    def test_credit_only_caption_and_url_alt_are_not_sent_for_translation(self) -> None:
+        placements = [
+            {"path": "images/1.jpg", "caption": "PETER PEZARIS", "credit": ""},
+            {"path": "images/2.jpg", "caption": "", "credit": "", "alt_text": "https://example.com/qr"},
+        ]
+        insights = translate_image_descriptions(
+            None,
+            sync_wsj.DEFAULTS,
+            "Article",
+            placements,
+            [],
+            logging.getLogger("test"),
+        )
+
+        self.assertEqual(insights, [])
+
+    def test_legacy_caption_moves_to_image_insights(self) -> None:
+        placements, insights = _migrate_image_description_fields([{
+            "path": "images/1.jpg",
+            "placement": "lead",
+            "caption": "Source caption",
+            "caption_zh": "中文图片说明",
+        }])
+
+        self.assertNotIn("caption_zh", placements[0])
+        self.assertEqual(insights, [{
+            "path": "images/1.jpg",
+            "image_type": "photo",
+            "description": "中文图片说明",
+        }])
+
+    def test_identical_downloaded_images_share_one_path_and_placement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {key: dict(value) for key, value in sync_wsj.DEFAULTS.items()}
+            config["paths"]["output_root"] = str(Path(temp_dir) / "output_results")
+            image_dir = Path(config["paths"]["output_root"]) / "WSJ" / "2026-08-22" / "images"
+            image_dir.mkdir(parents=True)
+            (image_dir / "first.jpg").write_bytes(b"same-image")
+            (image_dir / "duplicate.jpg").write_bytes(b"same-image")
+            article = {
+                "issue_date": "2026-08-22",
+                "images": ["images/first.jpg", "images/duplicate.jpg"],
+                "image_placements": [
+                    {"path": "images/first.jpg", "placement": "lead", "caption": "Caption"},
+                    {"path": "images/duplicate.jpg", "placement": "lead", "caption": "Caption"},
+                ],
+            }
+
+            deduplicate_article_image_metadata(article, config)
+
+        self.assertEqual(article["images"], ["images/first.jpg"])
+        self.assertEqual(len(article["image_placements"]), 1)
+        self.assertEqual(article["image_placements"][0]["path"], "images/first.jpg")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 from io import BytesIO
 import json
 import logging
@@ -1536,6 +1537,7 @@ def materialize_article_images(
     image_dir = _paper_output_root(cfg) / PAPER_PUBLICATION_TYPE / issue_date / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
+    path_by_digest: dict[str, str] = {}
     for index, image_url in enumerate(image_urls[:20], start=1):
         try:
             response = requests.get(
@@ -1547,10 +1549,16 @@ def materialize_article_images(
             if response.status_code != 200 or not content_type.lower().startswith("image/"):
                 raise ValueError(f"HTTP {response.status_code}, Content-Type={content_type!r}")
             image_content, content_type = _vision_supported_image(response.content, content_type)
+            digest = hashlib.sha256(image_content).hexdigest()
+            if digest in path_by_digest:
+                paths.append(path_by_digest[digest])
+                continue
             filename = f"{article_id}_{index:02d}{_image_extension(image_url, content_type)}"
             target = image_dir / filename
             _write_atomic_bytes(target, image_content)
-            paths.append(f"images/{filename}")
+            relative_path = f"images/{filename}"
+            path_by_digest[digest] = relative_path
+            paths.append(relative_path)
         except Exception as exc:
             log.warning(f"图片下载失败，保留远程 URL: {image_url[:100]} ({exc})")
             paths.append(image_url)
@@ -1583,17 +1591,287 @@ def materialize_ereader_images(
         if identity in seen:
             continue
         seen.add(identity)
-        placements.append(
-            {
-                "path": path,
-                "placement": placement,
-                "after_paragraph_index": paragraph_index,
-                "caption": str(image.caption or ""),
-                "credit": str(image.credit or ""),
-                "alt_text": str(image.alt_text or ""),
-            }
+        placements.append(_normalize_image_placement_metadata({
+            "path": path,
+            "placement": placement,
+            "after_paragraph_index": paragraph_index,
+            "caption": str(image.caption or ""),
+            "credit": str(image.credit or ""),
+            "alt_text": str(image.alt_text or ""),
+        }))
+    return list(dict.fromkeys(materialized)), placements
+
+
+def deduplicate_article_image_metadata(
+    article: dict[str, Any], cfg: dict[str, Any],
+) -> None:
+    """Collapse local image paths with identical bytes while keeping one metadata record."""
+    issue_date = str(article.get("issue_date") or "").strip()
+    issue_root = _paper_output_root(cfg) / PAPER_PUBLICATION_TYPE / issue_date
+    canonical_by_digest: dict[str, str] = {}
+    canonical_by_path: dict[str, str] = {}
+    for value in article.get("images") or []:
+        path = str(value or "").strip()
+        canonical = path
+        local_path = issue_root / path if path.startswith("images/") else None
+        if local_path is not None and local_path.is_file():
+            digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
+            canonical = canonical_by_digest.setdefault(digest, path)
+        canonical_by_path[path] = canonical
+    article["images"] = list(dict.fromkeys(
+        canonical_by_path.get(str(path or ""), str(path or ""))
+        for path in article.get("images") or []
+        if str(path or "").strip()
+    ))
+
+    deduplicated: list[dict[str, Any]] = []
+    by_identity: dict[tuple[str, str, int | None], dict[str, Any]] = {}
+    for raw_item in article.get("image_placements") or []:
+        if not isinstance(raw_item, dict):
+            continue
+        item = _normalize_image_placement_metadata(raw_item)
+        path = str(item.get("path") or "")
+        item["path"] = canonical_by_path.get(path, path)
+        identity = (
+            str(item.get("path") or ""),
+            str(item.get("placement") or "unlocated"),
+            item.get("after_paragraph_index"),
         )
-    return materialized, placements
+        existing = by_identity.get(identity)
+        if existing is None:
+            by_identity[identity] = item
+            deduplicated.append(item)
+            continue
+        for key in ("caption", "credit", "alt_text"):
+            if not str(existing.get(key) or "").strip() and str(item.get(key) or "").strip():
+                existing[key] = item[key]
+    article["image_placements"] = deduplicated
+
+    deduplicated_insights: list[dict[str, Any]] = []
+    insight_by_path: dict[str, dict[str, Any]] = {}
+    for raw_item in article.get("image_insights") or []:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        path = canonical_by_path.get(path, path)
+        item["path"] = path
+        existing = insight_by_path.get(path)
+        if existing is None:
+            insight_by_path[path] = item
+            deduplicated_insights.append(item)
+        elif not str(existing.get("description") or "").strip() and str(item.get("description") or "").strip():
+            existing["description"] = item["description"]
+    article["image_insights"] = deduplicated_insights
+
+
+def _looks_like_image_credit(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value or len(value) > 100 or re.search(r"[.!?]", value):
+        return False
+    letters = [char for char in value if char.isalpha()]
+    return bool(letters) and value == value.upper()
+
+
+def _normalize_image_placement_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    caption = str(normalized.get("caption") or "").strip()
+    credit = str(normalized.get("credit") or "").strip()
+    prefixed_credit = re.match(
+        r"^([A-Z][A-Z .'/’-]{2,60})\s+((?:From|At|Above|Below|Left|Right)\b[\s\S]+)$",
+        caption,
+    )
+    if prefixed_credit:
+        prefix, caption = prefixed_credit.groups()
+        credit = " | ".join(part for part in (credit, prefix.strip()) if part)
+    elif _looks_like_image_credit(caption):
+        credit = " | ".join(part for part in (credit, caption) if part)
+        caption = ""
+    normalized["caption"] = caption
+    normalized["credit"] = credit
+    if not caption and str(normalized.get("caption_zh") or "").strip() in {
+        "无图片说明", "暂无图片说明", "图片无说明",
+    }:
+        normalized["caption_zh"] = ""
+    return normalized
+
+
+def _migrate_image_description_fields(
+    placements: list[dict[str, Any]],
+    image_insights: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Move legacy placement descriptions into the shared image_insights schema."""
+    cleaned_placements: list[dict[str, Any]] = []
+    insights: list[dict[str, Any]] = []
+    insight_by_path: dict[str, dict[str, Any]] = {}
+    for raw in image_insights or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        item["path"] = path
+        insights.append(item)
+        insight_by_path.setdefault(path, item)
+
+    for raw in placements:
+        if not isinstance(raw, dict):
+            continue
+        item = _normalize_image_placement_metadata(raw)
+        path = str(item.get("path") or "").strip()
+        legacy_description = str(
+            item.pop("description_zh", "") or item.pop("caption_zh", "") or ""
+        ).strip()
+        item.pop("caption_zh", None)
+        cleaned_placements.append(item)
+        if not path or not legacy_description:
+            continue
+        insight = insight_by_path.get(path)
+        if insight is None:
+            insight = {"path": path, "image_type": "photo", "description": legacy_description}
+            insights.append(insight)
+            insight_by_path[path] = insight
+        else:
+            insight["description"] = legacy_description
+            insight.setdefault("image_type", "photo")
+    return cleaned_placements, insights
+
+
+def _set_image_insight_description(
+    image_insights: list[dict[str, Any]], path: str, description: str,
+) -> None:
+    for insight in image_insights:
+        if str(insight.get("path") or "") == path:
+            insight["description"] = description
+            insight.setdefault("image_type", "photo")
+            return
+    image_insights.append({
+        "path": path,
+        "image_type": "photo",
+        "description": description,
+    })
+
+
+def translate_image_descriptions(
+    client: Any,
+    cfg: dict[str, Any],
+    title: str,
+    placements: list[dict[str, Any]],
+    image_insights: list[dict[str, Any]] | None,
+    log_: logging.Logger,
+) -> list[dict[str, Any]]:
+    """Translate source captions into image_insights descriptions."""
+    translated, insights = _migrate_image_description_fields(placements, image_insights)
+    described_paths = {
+        str(item.get("path") or "")
+        for item in insights
+        if str(item.get("description") or "").strip()
+    }
+    pending: list[tuple[int, str]] = []
+    for index, item in enumerate(translated, start=1):
+        path = str(item.get("path") or "").strip()
+        source = str(item.get("caption") or "").strip()
+        if not source:
+            alt_text = str(item.get("alt_text") or "").strip()
+            if not re.match(r"^(?:https?://|www\.)", alt_text, re.IGNORECASE):
+                source = alt_text
+        if not path or path in described_paths or not source:
+            continue
+        if count_cn_chars(source):
+            _set_image_insight_description(insights, path, source)
+            described_paths.add(path)
+            continue
+        pending.append((index, source))
+    if not pending:
+        return insights
+
+    prompt_items = "\n".join(
+        f'{index}. {json.dumps(source, ensure_ascii=False)}'
+        for index, source in pending
+    )
+    prompt = f"""请把下面《华尔街日报》报道的图片说明翻译成自然、简洁的中文，只返回严格 JSON。
+
+要求：
+1. 忠实保留人物、地点、机构和画面信息，不增加原文没有的事实。
+2. 原文可能来自报纸 OCR；可以修正明显的重复字母、重复标点和断词，但不得据此补写内容。
+3. 保持输入 index 不变，每条输入必须返回一条非空译文。
+4. 只翻译图片说明，不处理摄影署名。
+
+文章标题：{title}
+图片说明：
+{prompt_items}
+
+Return JSON in this shape:
+{{"captions":[{{"index":1,"description":"中文图片说明"}}]}}
+"""
+    llm = cfg["llm"]
+    max_retries = int(cfg["crawl"].get("max_retries", 2))
+    last_error: Exception | None = None
+    expected = {index for index, _ in pending}
+    completed: dict[int, str] = {}
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=llm.get("model", "gpt-4o-mini"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "只返回 JSON。你是严谨的英中新闻图片编辑。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max(1024, len(pending) * 300),
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            payload = _extract_json_payload(response.choices[0].message.content or "")
+            raw_captions = payload.get("captions")
+            if not isinstance(raw_captions, list):
+                raise LLMOutputValidationError("图片说明翻译结果不是 captions 数组")
+            by_index: dict[int, str] = {}
+            for item in raw_captions:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item.get("index") or 0)
+                except (TypeError, ValueError):
+                    continue
+                description = str(
+                    item.get("description") or item.get("caption_zh") or ""
+                ).strip()
+                if index in expected and description and count_cn_chars(description):
+                    by_index[index] = description
+            completed.update(by_index)
+            missing = expected - set(completed)
+            if missing and attempt < max_retries:
+                raise LLMOutputValidationError(
+                    "图片说明中文翻译缺失: " + ", ".join(map(str, sorted(missing)))
+                )
+            for index, description in completed.items():
+                path = str(translated[index - 1].get("path") or "").strip()
+                if path:
+                    _set_image_insight_description(insights, path, description)
+            if missing:
+                log_.warning(
+                    "部分图片说明没有可用中文翻译，保留对应原文: %s",
+                    ", ".join(map(str, sorted(missing))),
+                )
+            return insights
+        except Exception as exc:
+            last_error = exc
+            log_.warning(f"图片说明翻译失败 (attempt {attempt + 1}): {exc}")
+            if not _should_retry_llm_error(exc, attempt, max_retries):
+                break
+            time.sleep(1.0)
+    for index, description in completed.items():
+        path = str(translated[index - 1].get("path") or "").strip()
+        if path:
+            _set_image_insight_description(insights, path, description)
+    log_.error(f"图片说明翻译最终失败，已保留成功项和其余英文原文: {title} ({last_error})")
+    return insights
 
 
 def _wsj_text_cover_url(graph_url: str) -> str:
@@ -2942,8 +3220,9 @@ def _next_seq(articles: list[dict[str, Any]], issue_date: str) -> int:
 
 def _compile_article_task(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
     """在线程中建立独立 LLM client，避免共享 HTTP client 的并发状态。"""
-    return compile_article_record(
-        make_llm_client(cfg),
+    client = make_llm_client(cfg)
+    article = compile_article_record(
+        client,
         cfg,
         issue_date=payload["issue_date"],
         section=payload["section"],
@@ -2954,6 +3233,21 @@ def _compile_article_task(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[
         log_=log,
         images=payload["images"],
     )
+    placements = payload.get("image_placements") or []
+    if article is not None and placements:
+        cleaned_placements, image_insights = _migrate_image_description_fields(
+            placements, list(article.get("image_insights") or []),
+        )
+        article["image_placements"] = cleaned_placements
+        article["image_insights"] = translate_image_descriptions(
+            client,
+            cfg,
+            str(payload.get("title") or ""),
+            cleaned_placements,
+            image_insights,
+            log,
+        )
+    return article
 
 
 def _analyze_article_images_task(cfg: dict[str, Any], issue_date: str, title: str, images: list[str]) -> list[dict[str, Any]]:
@@ -3240,6 +3534,78 @@ def refresh_article_glossary(
     return refreshed
 
 
+def refresh_image_captions(
+    cfg: dict[str, Any], article_ids: set[str],
+) -> list[dict[str, Any]]:
+    """补译已有图片说明到 image_insights，不重抓图片或重译正文。"""
+    existing = read_database_js()
+    targets: list[dict[str, Any]] = []
+    for article in existing:
+        if article_ids and str(article.get("id") or "") not in article_ids:
+            continue
+        placements = list(article.get("image_placements") or [])
+        _, insights = _migrate_image_description_fields(
+            placements, list(article.get("image_insights") or []),
+        )
+        described_paths = {
+            str(item.get("path") or "")
+            for item in insights
+            if str(item.get("description") or "").strip()
+        }
+        has_legacy_fields = any(
+            isinstance(item, dict)
+            and ("caption_zh" in item or "description_zh" in item)
+            for item in placements
+        )
+        has_missing_description = any(
+            isinstance(item, dict)
+            and str(item.get("path") or "").strip() not in described_paths
+            and bool(str(item.get("caption") or item.get("alt_text") or "").strip())
+            for item in placements
+        )
+        if has_legacy_fields or has_missing_description:
+            targets.append(article)
+    if not targets:
+        log.info("没有需要补译中文图片说明的文章")
+        return []
+    client: Any = None
+    refreshed: list[dict[str, Any]] = []
+    for article in targets:
+        deduplicate_article_image_metadata(article, cfg)
+        placements, insights = _migrate_image_description_fields(
+            list(article.get("image_placements") or []),
+            list(article.get("image_insights") or []),
+        )
+        described_paths = {
+            str(item.get("path") or "")
+            for item in insights
+            if str(item.get("description") or "").strip()
+        }
+        needs_llm = any(
+            str(item.get("path") or "").strip() not in described_paths
+            and bool(str(item.get("caption") or item.get("alt_text") or "").strip())
+            and not count_cn_chars(str(item.get("caption") or item.get("alt_text") or ""))
+            for item in placements
+        )
+        if needs_llm and client is None:
+            if not str(cfg["llm"].get("api_key") or "").strip():
+                raise RuntimeError("LLM_API_KEY 未配置，无法翻译图片说明")
+            client = make_llm_client(cfg)
+        article["image_placements"] = placements
+        article["image_insights"] = translate_image_descriptions(
+            client,
+            cfg,
+            str(article.get("title") or ""),
+            placements,
+            insights,
+            log,
+        )
+        refreshed.append(article)
+        log.info("已补译中文图片说明: %s - %s", article.get("id"), article.get("title"))
+    _persist_wsj_state(cfg, existing)
+    return refreshed
+
+
 # ---------------------------------------------------------------------------
 # Cookie 导入(把别处已登录的 cookie 灌到本机 Chrome profile)
 # ---------------------------------------------------------------------------
@@ -3491,6 +3857,7 @@ def process_wsj(
                         log.error("翻译/编译失败 %s: %s", metadata["url"], exc)
                         continue
                     if article:
+                        compiled_placements = article.get("image_placements")
                         article.update({
                             "source_id": metadata["source_id"],
                             "page": metadata["page"],
@@ -3500,7 +3867,11 @@ def process_wsj(
                             "source_pages": metadata["source_pages"],
                             "subtitle": metadata["subtitle"],
                             "byline": metadata["byline"],
-                            "image_placements": metadata["image_placements"],
+                            "image_placements": (
+                                compiled_placements
+                                if isinstance(compiled_placements, list)
+                                else metadata["image_placements"]
+                            ),
                         })
                         persist(article)
 
@@ -3597,8 +3968,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--login", action="store_true", help="打开独立 Chromium，人工登录并验证 eReader")
     p.add_argument("--refresh-glossary", action="store_true",
                    help="只按当前规则重新解析现有文章的中文关键词，不重抓或重译正文")
+    p.add_argument("--refresh-image-captions", action="store_true",
+                   help="只补译现有文章的中文图片说明，不重抓图片或重译正文")
     p.add_argument("--article-ids", default="",
-                   help="配合 --refresh-glossary，逗号分隔 article id；留空表示全部")
+                   help="配合刷新命令，逗号分隔 article id；留空表示全部")
     p.add_argument("--kill-stale", action="store_true",
                    help="启动前杀掉残留 Chrome 进程 + 删 lock 文件(默认也会自动做一次)")
     p.add_argument("--rebuild-outputs", action="store_true",
@@ -3630,6 +4003,10 @@ def main() -> int:
         selected_dates = sorted({str(item.get("issue_date") or "") for item in articles})
         for issue_date in selected_dates:
             refresh_article_glossary(cfg, issue_date, article_ids)
+        return 0
+    if args.refresh_image_captions:
+        article_ids = {item.strip() for item in args.article_ids.split(",") if item.strip()}
+        refresh_image_captions(cfg, article_ids)
         return 0
     process_wsj(
         cfg,

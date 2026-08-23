@@ -678,6 +678,9 @@
 
     function normalizeImagePlacements(article) {
         const knownPaths = new Set((article.images || []).map(String));
+        const insightDescriptions = new Map((article.image_insights || [])
+            .filter(item => item && item.path && item.description)
+            .map(item => [String(item.path), String(item.description)]));
         return (article.image_placements || [])
             .filter(item => item && item.path && (!knownPaths.size || knownPaths.has(String(item.path))))
             .map(item => ({
@@ -687,6 +690,7 @@
                 caption: item.caption || '',
                 credit: item.credit || '',
                 alt_text: item.alt_text || '',
+                description: insightDescriptions.get(String(item.path)) || '',
             }));
     }
 
@@ -695,8 +699,8 @@
         const title = position === 'unlocated' ? '<div class="article-image-analysis-title">未定位图片</div>' : '';
         return `<div class="article-image-analysis article-image-${escapeHtml(position)}">${title}<div class="article-image-grid">${items.map((item, index) => {
             const src = resolveIssueAsset(issue, item.path);
-            const alt = item.alt_text || item.caption || '';
-            const captionParts = [item.caption, item.credit].filter(Boolean);
+            const alt = item.description || item.alt_text || item.caption || '';
+            const captionParts = [item.description, item.credit].filter(Boolean);
             return `<figure class="article-image-item" data-image-index="${index}">
                 <img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy">
                 ${captionParts.length ? `<figcaption>${captionParts.map(escapeHtml).join('<br>')}</figcaption>` : ''}
@@ -705,13 +709,17 @@
     }
 
     function renderArticleImages(article, issue) {
+        const insightByPath = new Map((article.image_insights || [])
+            .filter(item => item && item.path)
+            .map(item => [String(item.path), item]));
         const images = (article.images || []).map(path => ({
             path: resolveIssueAsset(issue, path),
             rawPath: path,
+            insight: insightByPath.get(String(path)) || null,
         }));
         if (!images.length) return '';
         return `<div class="article-image-analysis"><div class="article-image-analysis-title">图片与图表</div><div class="article-image-grid">${images.map((image, index) => {
-            const caption = article.title || '';
+            const caption = image.insight?.description || article.title_zh || article.title || '';
             return `<figure class="article-image-item" data-image-index="${index}"><img src="${escapeHtml(image.path)}" alt="${escapeHtml(caption)}" loading="lazy"><figcaption>${escapeHtml(caption)}</figcaption></figure>`;
         }).join('')}</div></div>`;
     }

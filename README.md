@@ -15,7 +15,7 @@
   `source_id` 保留正文节点更多、文本更长的版本，并合并 `source_pages`。
 - 旧期次缺少跳转信息时，才按标准化后的完全相同标题去重，同样保留正文更完整的版本。
 - 只保存能解析出普通正文段落的 Editorial 内容；广告、行情表、视频、音频和 Podcast 不入库。
-- 图片保留 eReader 原始位置、caption、credit 和 alt；不调用 AI 生成图片说明。
+- 图片的 eReader 原始位置、caption、credit 和 alt 保存在 `image_placements`；来源说明的中文翻译保存在同路径 `image_insights[].description`，不根据画面编造缺失说明。
 
 eReader 的 Newsmemory `TOKEN` 是短期会话凭据，只在浏览器内存中使用，不写入日志、配置或数据库。
 
@@ -58,6 +58,9 @@ python sync_wsj.py --date 2026-08-21
 
 # 从根 database.js 重建每日数据库和索引
 python sync_wsj.py --rebuild-outputs
+
+# 只为历史数据补译中文图片说明，可用 --article-ids 限定文章
+python sync_wsj.py --refresh-image-captions
 ```
 
 为了准确识别 A1/A10 续文，`--dry-run` 也会读取整期正文，但不会下载图片、调用 LLM 或写数据库。
@@ -97,7 +100,7 @@ cd /Users/luzhe/Desktop/code/agent_skills/wsj_archiver_skill
 ```text
 publication_date, page, page_article_index, print_page_label,
 print_section, source_pages, source_id, subtitle, byline,
-images, image_placements
+images, image_placements（原始位置/caption/credit/alt）, image_insights（中文 description）
 ```
 
 期次级 `pages` 中每个版面包含 `page`、`print_page_label`、`print_section` 和 `article_ids`。
