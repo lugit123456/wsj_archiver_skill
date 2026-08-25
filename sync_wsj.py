@@ -368,15 +368,17 @@ def read_database_js(path: Path | None = None) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     text = path.read_text(encoding="utf-8")
-    # 抓最后一个赋值(避免注释里出现相同模式)。
-    matches = list(re.finditer(r"window\.economist_db\s*=\s*(\[[\s\S]*?\])\s*;", text))
+    # 抓最后一个赋值(避免注释里出现相同模式)，再交给 JSON decoder
+    # 解析完整数组；正文字符串中可能合法出现 `];`。
+    matches = list(re.finditer(r"window\.economist_db\s*=\s*", text))
     if not matches:
         log.warning("database.js 格式异常,按空数组处理")
         return []
-    raw = matches[-1].group(1)
+    raw = text[matches[-1].end():].lstrip()
     if not raw.strip() or raw.strip() == "[]":
         return []
-    return json.loads(raw)
+    data, _ = json.JSONDecoder().raw_decode(raw)
+    return data
 
 
 def _serialize_for_js(obj: Any) -> str:
