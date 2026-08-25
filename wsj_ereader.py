@@ -448,17 +448,29 @@ class WsjEReaderAdapter:
         return self.issue_date
 
     def available_issues(self) -> list[str]:
-        if self.frame is None:
+        frame = _find_reader_frame(self.page)
+        if frame is None:
             return []
-        rows = self.frame.run_js(_SELECT_OPTIONS_SCRIPT, "#pullDownDate") or []
+        self.frame = frame
+        rows = frame.run_js(_SELECT_OPTIONS_SCRIPT, "#pullDownDate") or []
         return [_date_from_value(row["value"]) for row in rows if row.get("value")]
 
     def select_issue(self, issue_date: str | None) -> str:
         if self.frame is None:
             raise EReaderError("阅读器尚未连接")
+
+        def read_options() -> list[dict[str, Any]]:
+            frame = _find_reader_frame(self.page)
+            if frame is None:
+                return []
+            options = frame.run_js(_SELECT_OPTIONS_SCRIPT, "#pullDownDate") or []
+            if options:
+                self.frame = frame
+            return options
+
         try:
             options = _wait_for(
-                lambda: self.frame.run_js(_SELECT_OPTIONS_SCRIPT, "#pullDownDate") or [],
+                read_options,
                 timeout_s=self.timeout_s,
                 message="等待 eReader 出版日期列表超时",
             )
@@ -475,13 +487,20 @@ class WsjEReaderAdapter:
                 f"eReader 当前日期列表没有 {issue_date}；可选日期: {available}"
             )
         if str(selected.get("value")) != raw:
+            frame = _find_reader_frame(self.page)
+            if frame is not None:
+                self.frame = frame
             select = self.frame.ele("css:#pullDownDate", timeout=2)
             if not select:
                 raise EReaderError("找不到日期选择控件")
             select.select.by_value(raw, timeout=3)
 
             def changed() -> bool:
-                state = self.frame.run_js(
+                frame = _find_reader_frame(self.page)
+                if frame is None:
+                    return False
+                self.frame = frame
+                state = frame.run_js(
                     "function(v){const s=document.querySelector('#pullDownDate');"
                     "const p=document.querySelector('#pullDownPage');"
                     "return Boolean(s && s.value===v && p && p.options.length);}",
@@ -494,9 +513,11 @@ class WsjEReaderAdapter:
         return issue_date
 
     def _read_pages(self) -> list[dict[str, Any]]:
-        if self.frame is None:
+        frame = _find_reader_frame(self.page)
+        if frame is None:
             return []
-        rows = self.frame.run_js(_SELECT_OPTIONS_SCRIPT, "#pullDownPage") or []
+        self.frame = frame
+        rows = frame.run_js(_SELECT_OPTIONS_SCRIPT, "#pullDownPage") or []
         pages: list[dict[str, Any]] = []
         for index, row in enumerate(rows, start=1):
             label = normalise_page_label(str(row.get("text") or ""))

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from sync_wsj import (
     DEFAULTS,
+    _compile_article_task,
     _summary_length_bounds,
     compile_article_record,
 )
@@ -77,7 +78,12 @@ class ArticleCompileTests(unittest.TestCase):
         summary_prompt = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
         self.assertIn("不写摘要", translation_prompt)
         self.assertIn("不是专名", translation_prompt)
-        self.assertIn("不机械写成", translation_prompt)
+        self.assertIn("只保留英文人名", translation_prompt)
+        for name in ("Google", "Reddit", "Instagram", "TikTok", "Sensor Tower"):
+            self.assertIn(name, translation_prompt)
+            self.assertIn(name, summary_prompt)
+        self.assertIn("不能写“谷歌”“红迪”“照片墙”“抖音海外版”“传感器塔”", translation_prompt)
+        self.assertIn("此规则同时适用于 title_zh 和 summary_md", summary_prompt)
         self.assertNotIn('"summary_md"', translation_prompt)
         self.assertIn("这不是逐段翻译", summary_prompt)
         self.assertIn("政治和外交语境", summary_prompt)
@@ -97,6 +103,38 @@ class ArticleCompileTests(unittest.TestCase):
                 "glossary_version",
             },
         )
+
+    def test_compile_task_keeps_images_without_generating_descriptions(self) -> None:
+        article = {
+            "id": "art_test_images",
+            "image_insights": [],
+        }
+        payload = {
+            "issue_date": "2026-08-08",
+            "section": "Main",
+            "title": "Image test",
+            "url": "https://example.com/images",
+            "body": "Source paragraph.",
+            "article_id": "art_test_images",
+            "images": ["images/example.jpg"],
+            "image_placements": [{
+                "path": "images/example.jpg",
+                "placement": "lead",
+                "caption": "Original caption",
+                "credit": "PHOTO CREDIT",
+                "alt_text": "Original alt text",
+            }],
+        }
+
+        with patch("sync_wsj.make_llm_client", return_value=object()), \
+                patch("sync_wsj.compile_article_record", return_value=article), \
+                patch("sync_wsj.translate_image_descriptions") as translate_images:
+            result = _compile_article_task(_config(), payload)
+
+        self.assertIs(result, article)
+        self.assertEqual(result["image_insights"], [])
+        self.assertEqual(result["image_placements"][0]["caption"], "Original caption")
+        translate_images.assert_not_called()
 
     def test_translation_validation_retries_without_repeating_summary(self) -> None:
         client, completions = _client([

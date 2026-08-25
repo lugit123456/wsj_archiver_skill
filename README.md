@@ -15,7 +15,8 @@
   `source_id` 保留正文节点更多、文本更长的版本，并合并 `source_pages`。
 - 旧期次缺少跳转信息时，才按标准化后的完全相同标题去重，同样保留正文更完整的版本。
 - 只保存能解析出普通正文段落的 Editorial 内容；广告、行情表、视频、音频和 Podcast 不入库。
-- 图片的 eReader 原始位置、caption、credit 和 alt 保存在 `image_placements`；来源说明的中文翻译保存在同路径 `image_insights[].description`，不根据画面编造缺失说明。
+- 图片只下载并按 eReader 原始位置输出，不调用 LLM 解析画面或翻译图片说明。原始 caption、credit 和 alt 仍保存在 `image_placements` 作为来源元数据；新增文章的 `image_insights` 保持为空，前端不显示图片说明。
+- 正文翻译、中文标题和中文解读中的英文平台名、产品名、品牌名、人名、公司名和机构名保留英文原文，例如 `Google`、`Reddit`、`Instagram`、`TikTok`、`Sensor Tower`，不使用音译、意译或中文网络俗称。
 
 eReader 的 Newsmemory `TOKEN` 是短期会话凭据，只在浏览器内存中使用，不写入日志、配置或数据库。
 
@@ -31,6 +32,7 @@ cp .env.example .env
 
 在 `.env` 填写 `LLM_API_KEY`。默认使用项目内 `.wsj-browser/` 独立 Chromium profile，
 并把 Cookie 备份到 `.wsj-auth.json`（权限 `0600`）。
+图片始终只下载和输出；不提供启用 LLM 图片解析或图片说明翻译的配置。
 
 ## 登录
 
@@ -59,8 +61,6 @@ python sync_wsj.py --date 2026-08-21
 # 从根 database.js 重建每日数据库和索引
 python sync_wsj.py --rebuild-outputs
 
-# 只为历史数据补译中文图片说明，可用 --article-ids 限定文章
-python sync_wsj.py --refresh-image-captions
 ```
 
 为了准确识别 A1/A10 续文，`--dry-run` 也会读取整期正文，但不会下载图片、调用 LLM 或写数据库。
@@ -100,7 +100,7 @@ cd /Users/luzhe/Desktop/code/agent_skills/wsj_archiver_skill
 ```text
 publication_date, page, page_article_index, print_page_label,
 print_section, source_pages, source_id, subtitle, byline,
-images, image_placements（原始位置/caption/credit/alt）, image_insights（中文 description）
+images, image_placements（原始位置/caption/credit/alt）, image_insights（新增文章为空）
 ```
 
 期次级 `pages` 中每个版面包含 `page`、`print_page_label`、`print_section` 和 `article_ids`。

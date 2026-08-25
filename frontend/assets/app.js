@@ -611,14 +611,6 @@
         return lines.join('\n');
     }
 
-    function renderImageGallery(article, issue) {
-        const images = (article.images || []).map(path => ({
-            path: resolveIssueAsset(issue, path),
-            caption: article.title || '',
-        }));
-        return images;
-    }
-
     function renderBilingual(article, issue) {
         const grid = document.getElementById('bilingual-grid');
         const paragraphs = article.paragraphs || [];
@@ -678,50 +670,31 @@
 
     function normalizeImagePlacements(article) {
         const knownPaths = new Set((article.images || []).map(String));
-        const insightDescriptions = new Map((article.image_insights || [])
-            .filter(item => item && item.path && item.description)
-            .map(item => [String(item.path), String(item.description)]));
         return (article.image_placements || [])
             .filter(item => item && item.path && (!knownPaths.size || knownPaths.has(String(item.path))))
             .map(item => ({
                 path: String(item.path),
                 placement: item.placement || 'unlocated',
                 after_paragraph_index: item.after_paragraph_index,
-                caption: item.caption || '',
-                credit: item.credit || '',
-                alt_text: item.alt_text || '',
-                description: insightDescriptions.get(String(item.path)) || '',
             }));
     }
 
     function renderPlacedImages(items, issue, position) {
         if (!items.length) return '';
-        const title = position === 'unlocated' ? '<div class="article-image-analysis-title">未定位图片</div>' : '';
-        return `<div class="article-image-analysis article-image-${escapeHtml(position)}">${title}<div class="article-image-grid">${items.map((item, index) => {
+        return `<div class="article-image-analysis article-image-${escapeHtml(position)}"><div class="article-image-grid">${items.map((item, index) => {
             const src = resolveIssueAsset(issue, item.path);
-            const alt = item.description || item.alt_text || item.caption || '';
-            const captionParts = [item.description, item.credit].filter(Boolean);
             return `<figure class="article-image-item" data-image-index="${index}">
-                <img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy">
-                ${captionParts.length ? `<figcaption>${captionParts.map(escapeHtml).join('<br>')}</figcaption>` : ''}
+                <img src="${escapeHtml(src)}" alt="" loading="lazy">
             </figure>`;
         }).join('')}</div></div>`;
     }
 
     function renderArticleImages(article, issue) {
-        const insightByPath = new Map((article.image_insights || [])
-            .filter(item => item && item.path)
-            .map(item => [String(item.path), item]));
-        const images = (article.images || []).map(path => ({
-            path: resolveIssueAsset(issue, path),
-            rawPath: path,
-            insight: insightByPath.get(String(path)) || null,
-        }));
+        const images = (article.images || []).map(path => resolveIssueAsset(issue, path));
         if (!images.length) return '';
-        return `<div class="article-image-analysis"><div class="article-image-analysis-title">图片与图表</div><div class="article-image-grid">${images.map((image, index) => {
-            const caption = image.insight?.description || article.title_zh || article.title || '';
-            return `<figure class="article-image-item" data-image-index="${index}"><img src="${escapeHtml(image.path)}" alt="${escapeHtml(caption)}" loading="lazy"><figcaption>${escapeHtml(caption)}</figcaption></figure>`;
-        }).join('')}</div></div>`;
+        return `<div class="article-image-analysis"><div class="article-image-grid">${images.map((image, index) =>
+            `<figure class="article-image-item" data-image-index="${index}"><img src="${escapeHtml(image)}" alt="" loading="lazy"></figure>`
+        ).join('')}</div></div>`;
     }
 
     function applyGlossaryAnnotations(grid, article, issue) {
@@ -1025,9 +998,7 @@
                 event.preventDefault();
                 event.stopPropagation();
                 const src = img.currentSrc || img.src;
-                const caption = img.closest('figure')?.querySelector('figcaption')?.textContent?.trim()
-                    || img.alt || '';
-                openLightbox([{ path: resolveIssueAsset(issue, src), caption }], 0);
+                openLightbox([{ path: resolveIssueAsset(issue, src), caption: '' }], 0);
             });
         });
     }

@@ -96,6 +96,7 @@ SUMMARY_SYSTEM_PROMPT: str = """\
 2. 严禁遗漏任何核心论点和数据(数字、人物、机构名、年份)。
 3. 严禁引入原文外的信息。
 4. 若原文涉及争议,保留双方观点,标注来源。
+5. 英文平台名、产品名、品牌名、人名、公司名和机构名保留英文原文，不音译、意译或使用中文网络俗称。
 
 严格按以下 Markdown 格式输出(不可增删章节):
 
@@ -329,9 +330,8 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
     raw_glossary_enabled = src.get("LLM_GLOSSARY_ENABLED", "").strip().lower()
     if raw_glossary_enabled:
         cfg["glossary"]["enabled"] = raw_glossary_enabled in ("1", "true", "yes", "on")
-    raw_image_analysis_enabled = src.get("LLM_ANALYZE_ARTICLE_IMAGES", "").strip().lower()
-    if raw_image_analysis_enabled:
-        cfg["image_analysis"]["enabled"] = raw_image_analysis_enabled in ("1", "true", "yes", "on")
+    # 图片只下载和输出，不允许环境变量重新开启 LLM 图片解析。
+    cfg["image_analysis"]["enabled"] = False
 
     paths = cfg.get("paths") or {}
     if not str(paths.get("output_root") or "").strip():
@@ -2776,8 +2776,8 @@ def _translation_prompt(
 3. 根据上下文意译习语、隐喻和抽象表达，避免“降低杠杆”“使其过时”一类脱离中文语境的机械直译。
 4. 保持段落顺序和数量完全一致，每个输入段落必须有且只有一个对应译文，不得合并、拆分或遗漏。
 5. crosshead 译成简短自然的中文小标题；body 译成正文。
-6. 每个具体人物、组织、公司、政策或法律、事件、地点、作品、出版物、项目及缩写第一次出现时，在中文名称后用全角括号保留规范英文原文；后续不必重复。“海湾国家（Gulf states）”这类泛称不是专名，不要添加英文括注。
-7. Mr、Mrs、Ms、Dr 等英文称谓通常只译人名，不机械写成“先生”“女士”或“博士”；只有称谓本身影响语义时才保留。
+6. 英文平台名、产品名、品牌名、人名、公司名和机构名一律保留原文，不音译、意译或改写成中文，也不要采用中文网络俗称。例如必须写 Google、Reddit、Instagram、TikTok、Sensor Tower，不能写“谷歌”“红迪”“照片墙”“抖音海外版”“传感器塔”。普通地名、政策、法律和事件可自然翻译；确有必要时首次出现可在中文译名后括注英文原文。普通类别词和泛称不是专名，应自然翻译成中文。
+7. Mr、Mrs、Ms、Dr 等英文称谓通常省略，只保留英文人名；只有称谓本身影响语义时才保留称谓。
 8. 不写摘要、评论、说明或 Markdown 代码块。
 
 Title: {title}
@@ -2860,6 +2860,7 @@ def _summary_prompt(
 6. 对争议性判断明确归属于文章、相关国家或相关人物，不把观点写成未经限定的事实。
 7. summary_md 使用 {min_cn_chars}-{max_cn_chars} 个汉字。文章较长时已经放宽上限，应利用额外篇幅讲清逻辑，而不是让句子变得更长。返回前自行检查，但不要输出字数。
 8. title_zh 应简洁、自然、准确，避免逐词翻译造成歧义。政治和外交语境中的 deal 通常译为“协议”或“安排”，不要写成“交易”“谈一笔交易”等商业化表达。
+9. 英文平台名、产品名、品牌名、人名、公司名和机构名一律保留原文，不音译、意译或使用中文网络俗称。例如必须写 Google、Reddit、Instagram、TikTok、Sensor Tower，不能写“谷歌”“红迪”“照片墙”“抖音海外版”“传感器塔”。此规则同时适用于 title_zh 和 summary_md。
 
 Title: {title}
 Section: {section}
@@ -3235,18 +3236,11 @@ def _compile_article_task(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[
     )
     placements = payload.get("image_placements") or []
     if article is not None and placements:
-        cleaned_placements, image_insights = _migrate_image_description_fields(
+        cleaned_placements, _ = _migrate_image_description_fields(
             placements, list(article.get("image_insights") or []),
         )
         article["image_placements"] = cleaned_placements
-        article["image_insights"] = translate_image_descriptions(
-            client,
-            cfg,
-            str(payload.get("title") or ""),
-            cleaned_placements,
-            image_insights,
-            log,
-        )
+        article["image_insights"] = []
     return article
 
 
@@ -3968,8 +3962,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--login", action="store_true", help="打开独立 Chromium，人工登录并验证 eReader")
     p.add_argument("--refresh-glossary", action="store_true",
                    help="只按当前规则重新解析现有文章的中文关键词，不重抓或重译正文")
-    p.add_argument("--refresh-image-captions", action="store_true",
-                   help="只补译现有文章的中文图片说明，不重抓图片或重译正文")
     p.add_argument("--article-ids", default="",
                    help="配合刷新命令，逗号分隔 article id；留空表示全部")
     p.add_argument("--kill-stale", action="store_true",
@@ -4003,10 +3995,6 @@ def main() -> int:
         selected_dates = sorted({str(item.get("issue_date") or "") for item in articles})
         for issue_date in selected_dates:
             refresh_article_glossary(cfg, issue_date, article_ids)
-        return 0
-    if args.refresh_image_captions:
-        article_ids = {item.strip() for item in args.article_ids.split(",") if item.strip()}
-        refresh_image_captions(cfg, article_ids)
         return 0
     process_wsj(
         cfg,

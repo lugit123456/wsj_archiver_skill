@@ -15,6 +15,7 @@ from sync_wsj import (
     _wsj_text_cover_url,
     acquire_run_lock,
     deduplicate_article_image_metadata,
+    load_config,
     materialize_ereader_images,
     translate_image_descriptions,
 )
@@ -28,6 +29,11 @@ def read_daily_payload(path: Path) -> dict[str, object]:
 
 
 class WsjStorageTests(unittest.TestCase):
+    def test_image_analysis_cannot_be_enabled_by_environment(self) -> None:
+        config = load_config({"LLM_ANALYZE_ARTICLE_IMAGES": "true"})
+
+        self.assertFalse(config["image_analysis"]["enabled"])
+
     def test_cover_text_layer_matches_graph_resource(self) -> None:
         graph_url = (
             "https://wsj-bcdn.newsmemory.com/ajax-request.php?"
