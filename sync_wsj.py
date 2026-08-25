@@ -58,6 +58,7 @@ GENERIC_GLOSSARY_TERMS = {
 
 PAPER_PUBLICATION_TYPE = "WSJ"
 PAPER_PUBLICATION_NAME = "The Wall Street Journal"
+BLANK_IMAGE_DESCRIPTION = " "
 
 
 def validate_issue_date(issue_date: str) -> tuple[bool, str]:
@@ -456,6 +457,38 @@ def _group_articles_by_issue(articles: list[dict[str, Any]]) -> dict[str, list[d
     return dict(sorted(grouped.items(), key=lambda item: item[0], reverse=True))
 
 
+def _ensure_image_insight_placeholders(
+    images: list[str],
+    image_insights: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Give every image a blank, truthy description for the shared legacy frontend."""
+    by_path: dict[str, dict[str, Any]] = {}
+    for raw in image_insights or []:
+        if not isinstance(raw, dict):
+            continue
+        path = str(raw.get("path") or "").strip()
+        if not path or path in by_path:
+            continue
+        item = dict(raw)
+        item["path"] = path
+        item.setdefault("image_type", "photo")
+        if not str(item.get("description") or ""):
+            item["description"] = BLANK_IMAGE_DESCRIPTION
+        by_path[path] = item
+
+    output: list[dict[str, Any]] = []
+    for value in images:
+        path = str(value or "").strip()
+        if not path:
+            continue
+        output.append(by_path.get(path, {
+            "path": path,
+            "image_type": "photo",
+            "description": BLANK_IMAGE_DESCRIPTION,
+        }))
+    return output
+
+
 def _normalise_paper_article(article: dict[str, Any], index: int) -> dict[str, Any]:
     article_id = str(article.get("id") or f"art_{index:03d}")
     source_paragraphs = article.get("paragraphs") if isinstance(article.get("paragraphs"), list) else []
@@ -504,6 +537,7 @@ def _normalise_paper_article(article: dict[str, Any], index: int) -> dict[str, A
     if print_page_label.upper() == "A1" and print_section.casefold() == "main":
         print_section = "PAGE ONE"
 
+    images = [str(path) for path in (article.get("images") or []) if str(path or "").strip()]
     return {
         "id": article_id,
         "publication_type": PAPER_PUBLICATION_TYPE,
@@ -529,9 +563,11 @@ def _normalise_paper_article(article: dict[str, Any], index: int) -> dict[str, A
         "content_markdown": content_markdown,
         "content_raw": str(article.get("content_raw") or article.get("content_markdown") or "").strip(),
         "paragraphs": normalized_paragraphs,
-        "images": article.get("images") or [],
+        "images": images,
         "image_placements": article.get("image_placements") or [],
-        "image_insights": article.get("image_insights") or [],
+        "image_insights": _ensure_image_insight_placeholders(
+            images, list(article.get("image_insights") or []),
+        ),
         "term_annotations": article.get("term_annotations") or [],
         "glossary_analysis_complete": bool(article.get("glossary_analysis_complete")),
         "glossary_version": int(article.get("glossary_version") or 0),
@@ -3077,7 +3113,7 @@ def compile_article_record(
             "content_markdown": "",
             "paragraphs": [],
             "images": images,
-            "image_insights": [],
+            "image_insights": _ensure_image_insight_placeholders(images),
             "glossary_entries": [],
             "term_annotations": [],
             "glossary_analysis_complete": False,
@@ -3141,7 +3177,7 @@ def compile_article_record(
         "content_markdown": _format_source_content_markdown(source_paragraphs),
         "paragraphs": compiled_paragraphs,
         "images": images or [],
-        "image_insights": [],
+        "image_insights": _ensure_image_insight_placeholders(images or []),
         "compiled_article": compile_complete,
         "compile_status": "complete" if compile_complete else "fallback",
     }
@@ -3240,7 +3276,9 @@ def _compile_article_task(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[
             placements, list(article.get("image_insights") or []),
         )
         article["image_placements"] = cleaned_placements
-        article["image_insights"] = []
+        article["image_insights"] = _ensure_image_insight_placeholders(
+            list(article.get("images") or payload.get("images") or []),
+        )
     return article
 
 

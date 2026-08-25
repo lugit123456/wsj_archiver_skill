@@ -12,6 +12,7 @@ import sync_wsj
 from sync_wsj import (
     _persist_wsj_state,
     _migrate_image_description_fields,
+    _ensure_image_insight_placeholders,
     _wsj_text_cover_url,
     acquire_run_lock,
     deduplicate_article_image_metadata,
@@ -29,6 +30,18 @@ def read_daily_payload(path: Path) -> dict[str, object]:
 
 
 class WsjStorageTests(unittest.TestCase):
+    def test_blank_image_description_blocks_legacy_title_fallback(self) -> None:
+        insights = _ensure_image_insight_placeholders(
+            ["images/1.jpg", "images/2.jpg"],
+            [{"path": "images/2.jpg", "image_type": "chart", "description": "真实说明"}],
+        )
+
+        self.assertEqual(insights, [
+            {"path": "images/1.jpg", "image_type": "photo", "description": " "},
+            {"path": "images/2.jpg", "image_type": "chart", "description": "真实说明"},
+        ])
+        self.assertEqual(insights[0]["description"] or "Article title", " ")
+
     def test_image_analysis_cannot_be_enabled_by_environment(self) -> None:
         config = load_config({"LLM_ANALYZE_ARTICLE_IMAGES": "true"})
 
@@ -145,6 +158,11 @@ class WsjStorageTests(unittest.TestCase):
             self.assertEqual(stored["source_pages"], [1])
             self.assertEqual(stored["print_section"], "PAGE ONE")
             self.assertEqual(stored["image_placements"][0]["caption"], "Original caption")
+            self.assertEqual(stored["image_insights"], [{
+                "path": "images/art_2026-08-21_001_01.jpg",
+                "image_type": "photo",
+                "description": " ",
+            }])
             self.assertEqual(len(payload["pages"]), 1)
             self.assertEqual(payload["pages"][0]["pdf_page"], 1)
             self.assertEqual(payload["pages"][0]["print_page_label"], "A1")

@@ -15,7 +15,7 @@
   `source_id` 保留正文节点更多、文本更长的版本，并合并 `source_pages`。
 - 旧期次缺少跳转信息时，才按标准化后的完全相同标题去重，同样保留正文更完整的版本。
 - 只保存能解析出普通正文段落的 Editorial 内容；广告、行情表、视频、音频和 Podcast 不入库。
-- 图片只下载并按 eReader 原始位置输出，不调用 LLM 解析画面或翻译图片说明。原始 caption、credit 和 alt 仍保存在 `image_placements` 作为来源元数据；新增文章的 `image_insights` 保持为空，前端不显示图片说明。
+- 图片只下载并按 eReader 原始位置输出，不调用 LLM 解析画面或翻译图片说明。原始 caption、credit 和 alt 仍保存在 `image_placements` 作为来源元数据；每张图片生成同路径的 `image_insights`，`description` 默认是空白占位符，防止共享前端回退显示文章标题。以后需要说明时可由 Python 写入真实描述。
 - 正文翻译、中文标题和中文解读中的英文平台名、产品名、品牌名、人名、公司名和机构名保留英文原文，例如 `Google`、`Reddit`、`Instagram`、`TikTok`、`Sensor Tower`，不使用音译、意译或中文网络俗称。
 
 eReader 的 Newsmemory `TOKEN` 是短期会话凭据，只在浏览器内存中使用，不写入日志、配置或数据库。
@@ -100,7 +100,7 @@ cd /Users/luzhe/Desktop/code/agent_skills/wsj_archiver_skill
 ```text
 publication_date, page, page_article_index, print_page_label,
 print_section, source_pages, source_id, subtitle, byline,
-images, image_placements（原始位置/caption/credit/alt）, image_insights（新增文章为空）
+images, image_placements（原始位置/caption/credit/alt）, image_insights（默认空白 description）
 ```
 
 期次级 `pages` 中每个版面包含 `page`、`print_page_label`、`print_section` 和 `article_ids`。

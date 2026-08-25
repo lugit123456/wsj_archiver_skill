@@ -103,7 +103,6 @@ def main() -> int:
         "subtitle": source.subtitle,
         "byline": source.byline,
         "image_placements": placements,
-        "image_insights": [],
     })
     existing.append(article)
     _persist_wsj_state(cfg, existing)

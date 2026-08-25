@@ -132,7 +132,11 @@ class ArticleCompileTests(unittest.TestCase):
             result = _compile_article_task(_config(), payload)
 
         self.assertIs(result, article)
-        self.assertEqual(result["image_insights"], [])
+        self.assertEqual(result["image_insights"], [{
+            "path": "images/example.jpg",
+            "image_type": "photo",
+            "description": " ",
+        }])
         self.assertEqual(result["image_placements"][0]["caption"], "Original caption")
         translate_images.assert_not_called()
 
