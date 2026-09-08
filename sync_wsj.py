@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import fcntl
+import gc
 import hashlib
 from io import BytesIO
 import json
@@ -12,6 +14,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -158,6 +161,7 @@ DEFAULTS = {
     },
     "glossary": {
         "enabled": True,
+        "repair_enabled": True,
         "model": "",
         "max_terms": 32,
         "max_candidates": 32,
@@ -176,6 +180,8 @@ DEFAULTS = {
         "compile_workers": 2,
         "image_workers": 1,
         "max_pending": 4,
+        "segment_size": 0,
+        "repair_batch_size": 0,
     },
     "ereader": {
         "timeout_s": 30,
@@ -293,6 +299,11 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         "pipeline.compile_workers": src.get("LLM_COMPILE_WORKERS", "").strip(),
         "pipeline.image_workers": src.get("LLM_IMAGE_WORKERS", "").strip(),
         "pipeline.max_pending": src.get("LLM_MAX_PENDING", "").strip(),
+        "pipeline.segment_size": (
+            src.get("WSJ_SEGMENT_SIZE", "").strip()
+            or src.get("WSJ_BATCH_SIZE", "").strip()
+        ),
+        "pipeline.repair_batch_size": src.get("WSJ_REPAIR_BATCH_SIZE", "").strip(),
         "paths.database_js": src.get("DATABASE_JS_PATH", "").strip(),
         "paths.output_root": src.get("OUTPUT_ROOT", "").strip(),
         "paths.index_html": src.get("INDEX_HTML_PATH", "").strip(),
@@ -312,7 +323,13 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         "crawl": ["max_pages", "delay_min_s", "delay_max_s", "max_retries"],
         "glossary": ["max_terms", "max_candidates", "max_input_chars", "max_tokens", "max_retries"],
         "image_analysis": ["max_tokens", "max_retries", "max_images"],
-        "pipeline": ["compile_workers", "image_workers", "max_pending"],
+        "pipeline": [
+            "compile_workers",
+            "image_workers",
+            "max_pending",
+            "segment_size",
+            "repair_batch_size",
+        ],
         "ereader": ["timeout_s"],
     }
     for section, keys in int_fields.items():
@@ -331,6 +348,9 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
     raw_glossary_enabled = src.get("LLM_GLOSSARY_ENABLED", "").strip().lower()
     if raw_glossary_enabled:
         cfg["glossary"]["enabled"] = raw_glossary_enabled in ("1", "true", "yes", "on")
+    raw_glossary_repair_enabled = src.get("LLM_GLOSSARY_REPAIR_ENABLED", "").strip().lower()
+    if raw_glossary_repair_enabled:
+        cfg["glossary"]["repair_enabled"] = raw_glossary_repair_enabled in ("1", "true", "yes", "on")
     # 图片只下载和输出，不允许环境变量重新开启 LLM 图片解析。
     cfg["image_analysis"]["enabled"] = False
 
@@ -730,11 +750,10 @@ def _write_paper_issue_database(
     return database_path, pdf_id, payload
 
 
-def _write_paper_database_index(
+def _paper_database_index_items(
     output_root: Path,
     grouped_articles: dict[str, list[dict[str, Any]]],
-) -> Path:
-    index_path = output_root / "database_index.js"
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for issue_date, issue_articles in grouped_articles.items():
         pdf_id = f"{PAPER_PUBLICATION_TYPE}_{issue_date}_wsj-daily"
@@ -760,7 +779,46 @@ def _write_paper_database_index(
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
         )
+    return items
+
+
+def _write_paper_database_index(
+    output_root: Path,
+    grouped_articles: dict[str, list[dict[str, Any]]],
+) -> Path:
+    index_path = output_root / "database_index.js"
+    items = _paper_database_index_items(output_root, grouped_articles)
     text = "window.paper_db_index = " + json.dumps(items, ensure_ascii=False, indent=2) + ";\n"
+    _write_atomic_text(index_path, text)
+    return index_path
+
+
+def _upsert_paper_database_index(
+    output_root: Path,
+    grouped_articles: dict[str, list[dict[str, Any]]],
+) -> Path:
+    index_path = output_root / "database_index.js"
+    existing_items: list[dict[str, Any]] = []
+    if index_path.exists():
+        try:
+            text = index_path.read_text(encoding="utf-8")
+            matched = re.search(r"=\s*(\[.*\])\s*;\s*$", text, re.S)
+            if matched:
+                payload = json.loads(matched.group(1))
+                if isinstance(payload, list):
+                    existing_items = [item for item in payload if isinstance(item, dict)]
+        except Exception as exc:
+            log.warning("[paper] 读取既有 database_index.js 失败，将重写相关条目: %s", exc)
+
+    new_items = _paper_database_index_items(output_root, grouped_articles)
+    new_ids = {str(item.get("id") or "") for item in new_items}
+    merged = [
+        item for item in existing_items
+        if str(item.get("id") or "") not in new_ids
+    ]
+    merged.extend(new_items)
+    merged.sort(key=lambda item: str(item.get("publication_date") or ""))
+    text = "window.paper_db_index = " + json.dumps(merged, ensure_ascii=False, indent=2) + ";\n"
     _write_atomic_text(index_path, text)
     return index_path
 
@@ -773,7 +831,17 @@ def _sync_paper_outputs(
     issue_pages: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     output_root = _paper_output_root(cfg)
-    grouped = _group_articles_by_issue(articles)
+    if issue_date:
+        grouped = {
+            issue_date: [
+                article for article in articles
+                if str(article.get("issue_date") or "") == issue_date
+            ]
+        }
+        if not grouped[issue_date]:
+            return
+    else:
+        grouped = _group_articles_by_issue(articles)
     for grouped_issue_date, issue_articles in grouped.items():
         _write_paper_issue_database(
             output_root,
@@ -782,7 +850,10 @@ def _sync_paper_outputs(
             cover_image=(issue_covers or {}).get(grouped_issue_date, ""),
             pages=(issue_pages or {}).get(grouped_issue_date),
         )
-    _write_paper_database_index(output_root, grouped)
+    if issue_date:
+        _upsert_paper_database_index(output_root, grouped)
+    else:
+        _write_paper_database_index(output_root, grouped)
 
 
 def _date_key(s: str) -> int:
@@ -1073,6 +1144,9 @@ def open_browser(user_data_path: str, headless: bool):
         sys.exit(f"未安装 drissionpage: pip install -r requirements.txt ({e})")
 
     opts = ChromiumOptions()
+    browser_path = os.getenv("BROWSER_PATH", "").strip() or os.getenv("CHROME_PATH", "").strip()
+    if browser_path:
+        opts.set_browser_path(browser_path)
 
     # 0. 清残留进程 + lock(脚本崩过后会留下孤儿)
     _cleanup_stale_chrome_locks(user_data_path)
@@ -1083,7 +1157,7 @@ def open_browser(user_data_path: str, headless: bool):
 
     # 2. 设置用户目录
     opts.set_user_data_path(user_data_path)
-    opts.headless = bool(headless)
+    opts.headless(bool(headless))
 
     # 3. Mac 环境下建议加上这两个参数以增加稳定性
     opts.set_argument('--no-sandbox')
@@ -2762,7 +2836,7 @@ def enrich_article_glossary(
         article.get("term_annotations") or [],
         article.get("glossary_entries") or [],
     )
-    if succeeded and missing:
+    if succeeded and missing and glossary_cfg.get("repair_enabled", True):
         repair_limit = min(max_terms, len(missing))
         repair_prompt = _glossary_prompt(
             str(article.get("title") or "Untitled"), paragraphs, repair_limit, missing,
@@ -3404,6 +3478,278 @@ def _next_seq(articles: list[dict[str, Any]], issue_date: str) -> int:
     return (max(used) + 1) if used else 1
 
 
+def _normalized_title_key(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+
+
+def _existing_archive_keys(
+    articles: list[dict[str, Any]],
+) -> tuple[set[str], set[tuple[str, str]]]:
+    source_ids = {
+        str(article.get("source_id") or "").strip()
+        for article in articles
+        if str(article.get("source_id") or "").strip()
+    }
+    title_keys = {
+        (
+            str(article.get("issue_date") or ""),
+            _normalized_title_key(str(article.get("title") or "")),
+        )
+        for article in articles
+        if str(article.get("issue_date") or "") and str(article.get("title") or "").strip()
+    }
+    return source_ids, title_keys
+
+
+def _manifest_article_key(article: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(article.get("issue_date") or ""),
+        _normalized_title_key(str(article.get("title") or "")),
+    )
+
+
+def _manifest_article_archived(
+    article: dict[str, Any],
+    source_ids: set[str],
+    title_keys: set[tuple[str, str]],
+) -> bool:
+    source_id = str(article.get("source_id") or "").strip()
+    return bool(source_id and source_id in source_ids) or _manifest_article_key(article) in title_keys
+
+
+def _ereader_body_from_manifest(article: dict[str, Any]) -> str:
+    def clean_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    blocks: list[str] = []
+    for paragraph in article.get("paragraphs") or []:
+        if not isinstance(paragraph, dict):
+            continue
+        text = clean_text(paragraph.get("text"))
+        if not text:
+            continue
+        blocks.append(f"## {text}" if paragraph.get("role") == "crosshead" else text)
+    return "\n\n".join(blocks)
+
+
+def _manifest_images(article: dict[str, Any]) -> list[EReaderImage]:
+    images: list[EReaderImage] = []
+    for raw_image in article.get("images") or []:
+        if not isinstance(raw_image, dict):
+            continue
+        images.append(EReaderImage(
+            url=str(raw_image.get("url") or ""),
+            placement=str(raw_image.get("placement") or "unlocated"),
+            after_paragraph_index=raw_image.get("after_paragraph_index"),
+            caption=str(raw_image.get("caption") or ""),
+            credit=str(raw_image.get("credit") or ""),
+            alt_text=str(raw_image.get("alt_text") or ""),
+        ))
+    return images
+
+
+def _write_wsj_segment_manifest(
+    *,
+    selected_date: str,
+    cover_image: str,
+    pages: list[dict[str, Any]],
+    articles: list[EReaderArticle],
+) -> Path:
+    manifest_dir = ROOT / ".tmp"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"wsj_{selected_date}_",
+        suffix=".manifest.json.tmp",
+        dir=manifest_dir,
+    )
+    manifest_path = Path(tmp_path).with_suffix("")
+    payload = {
+        "selected_date": selected_date,
+        "cover_image": cover_image,
+        "pages": pages,
+        "articles": [asdict(article) for article in articles],
+    }
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(tmp_path, manifest_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return manifest_path
+
+
+def _remaining_manifest_articles(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    existing = read_database_js()
+    source_ids, title_keys = _existing_archive_keys(existing)
+    return [
+        article for article in manifest.get("articles") or []
+        if isinstance(article, dict)
+        and not _manifest_article_archived(article, source_ids, title_keys)
+    ]
+
+
+def _compile_wsj_manifest_batch(
+    cfg: dict[str, Any],
+    manifest_path: Path,
+    *,
+    batch_size: int,
+) -> int:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected_date = str(manifest.get("selected_date") or "")
+    issue_covers = {selected_date: str(manifest.get("cover_image") or "")} if selected_date else None
+    issue_pages = {selected_date: list(manifest.get("pages") or [])} if selected_date else None
+    remaining = _remaining_manifest_articles(manifest)
+    if batch_size > 0:
+        remaining = remaining[:batch_size]
+    if not remaining:
+        log.info("manifest %s 没有剩余待处理文章", manifest_path)
+        return 0
+
+    existing = read_database_js()
+    existing_source_ids, _ = _existing_archive_keys(existing)
+    next_sequence = _next_seq(existing, selected_date)
+    processed = 0
+    log.info(
+        "manifest %s 分段编译: 本批 %d 篇，当前库内 %d 篇",
+        manifest_path,
+        len(remaining),
+        sum(1 for article in existing if str(article.get("issue_date") or "") == selected_date),
+    )
+
+    for source_article in remaining:
+        article_id = f"art_{selected_date}_{next_sequence:03d}"
+        next_sequence += 1
+        images, image_placements = materialize_ereader_images(
+            _manifest_images(source_article),
+            cfg,
+            selected_date,
+            article_id,
+        )
+        metadata = {
+            "issue_date": selected_date,
+            "section": str(source_article.get("section") or ""),
+            "title": str(source_article.get("title") or ""),
+            "url": str(source_article.get("url") or EREADER_URL),
+            "body": _ereader_body_from_manifest(source_article),
+            "article_id": article_id,
+            "images": images,
+            "source_id": str(source_article.get("source_id") or ""),
+            "page": source_article.get("page"),
+            "page_article_index": source_article.get("page_article_index"),
+            "print_page_label": str(source_article.get("print_page_label") or ""),
+            "print_section": str(source_article.get("section") or ""),
+            "source_pages": list(source_article.get("source_pages") or []),
+            "subtitle": str(source_article.get("subtitle") or ""),
+            "byline": str(source_article.get("byline") or ""),
+            "image_placements": image_placements,
+        }
+        try:
+            article = _compile_article_task(cfg, metadata)
+        except Exception as exc:
+            log.error("翻译/编译失败 %s: %s", metadata["url"], exc)
+            article = None
+        if article:
+            compiled_placements = article.get("image_placements")
+            article.update({
+                "source_id": metadata["source_id"],
+                "page": metadata["page"],
+                "page_article_index": metadata["page_article_index"],
+                "print_page_label": metadata["print_page_label"],
+                "print_section": metadata["print_section"],
+                "source_pages": metadata["source_pages"],
+                "subtitle": metadata["subtitle"],
+                "byline": metadata["byline"],
+                "image_placements": (
+                    compiled_placements
+                    if isinstance(compiled_placements, list)
+                    else metadata["image_placements"]
+                ),
+            })
+            existing.append(article)
+            existing_source_ids.add(str(article.get("source_id") or ""))
+            _persist_wsj_state(
+                cfg,
+                existing,
+                issue_date=selected_date,
+                issue_covers=issue_covers,
+                issue_pages=issue_pages,
+            )
+            processed += 1
+            log.info("已收录并更新根库、每日库和轻量索引: %s - %s", article["id"], article["title"][:80])
+        del metadata, article, images, image_placements
+        gc.collect()
+    return processed
+
+
+def _count_archived_for_issue(issue_date: str) -> int:
+    return sum(
+        1 for article in read_database_js()
+        if str(article.get("issue_date") or "") == issue_date
+    )
+
+
+def _run_wsj_manifest_segments(
+    cfg: dict[str, Any],
+    manifest_path: Path,
+    *,
+    segment_size: int,
+) -> int:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected_date = str(manifest.get("selected_date") or "")
+    total = len([article for article in manifest.get("articles") or [] if isinstance(article, dict)])
+    segment_size = max(1, int(segment_size))
+    max_rounds = max(total + 10, (total // segment_size) + 20)
+    processed_total = 0
+
+    for round_index in range(1, max_rounds + 1):
+        remaining_count = len(_remaining_manifest_articles(manifest))
+        if remaining_count <= 0:
+            break
+        before_count = _count_archived_for_issue(selected_date)
+        log.info(
+            "启动 WSJ 分段子进程 %d: 剩余 %d 篇，本批最多 %d 篇",
+            round_index,
+            remaining_count,
+            segment_size,
+        )
+        child_env = os.environ.copy()
+        child_env["WSJ_SEGMENTED_CHILD"] = "1"
+        child_env["LLM_COMPILE_WORKERS"] = "1"
+        child_env["LLM_MAX_PENDING"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--compile-manifest",
+                str(manifest_path),
+                "--manifest-batch-size",
+                str(segment_size),
+            ],
+            env=child_env,
+            check=False,
+        )
+        after_count = _count_archived_for_issue(selected_date)
+        advanced = max(0, after_count - before_count)
+        processed_total += advanced
+        gc.collect()
+        if result.returncode != 0 and advanced == 0:
+            raise RuntimeError(f"WSJ 分段子进程失败且没有新增文章: rc={result.returncode}")
+        if advanced == 0:
+            remaining_count = len(_remaining_manifest_articles(manifest))
+            if remaining_count > 0:
+                raise RuntimeError(f"WSJ 分段没有新增文章，仍剩余 {remaining_count} 篇，停止避免空转")
+    else:
+        raise RuntimeError(f"WSJ 分段超过最大轮数 {max_rounds}，停止避免空转")
+
+    log.info("WSJ 分段编译完成: manifest 共 %d 篇，本次新增 %d 篇", total, processed_total)
+    return processed_total
+
+
 def _compile_article_task(cfg: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
     """在线程中建立独立 LLM client，避免共享 HTTP client 的并发状态。"""
     client = make_llm_client(cfg)
@@ -3918,10 +4264,89 @@ def repair_missing_translations(
             for article in remaining_targets
         }
         raise RuntimeError(f"[repair] 中文完整性检查未通过: {details}")
-    _sync_paper_outputs(cfg, final_articles)
+    for selected_date in selected_dates:
+        _sync_paper_outputs(cfg, final_articles, issue_date=selected_date)
     _maybe_rebuild_index(cfg)
     log.info("[repair] 中文完整性检查通过，修复 %d 篇", len(repaired))
     return repaired
+
+
+def _repair_target_article_ids(
+    issue_date: str | None = None,
+    article_ids: set[str] | None = None,
+) -> list[str]:
+    articles = read_database_js()
+    selected_dates = _select_repair_dates(articles, issue_date)
+    selected_ids = article_ids or set()
+    return [
+        str(article.get("id") or "")
+        for article in articles
+        if str(article.get("issue_date") or "") in selected_dates
+        and (not selected_ids or str(article.get("id") or "") in selected_ids)
+        and _article_quality_issues(article)
+        and str(article.get("id") or "")
+    ]
+
+
+def _run_repair_segments(
+    cfg: dict[str, Any],
+    *,
+    issue_date: str | None = None,
+    article_ids: set[str] | None = None,
+    batch_size: int = 1,
+) -> int:
+    """Run repair in short child processes so LLM/browser-sized heaps are released."""
+    batch_size = max(1, int(batch_size))
+    repaired_total = 0
+    max_rounds = 10000
+
+    for round_index in range(1, max_rounds + 1):
+        pending_ids = _repair_target_article_ids(issue_date, article_ids)
+        if not pending_ids:
+            log.info("[repair] 分段中文完整性检查通过，修复 %d 篇", repaired_total)
+            return repaired_total
+
+        batch_ids = pending_ids[:batch_size]
+        before_pending = set(pending_ids)
+        log.info(
+            "[repair] 启动分段修复子进程 %d: 剩余 %d 篇，本批 %s",
+            round_index,
+            len(pending_ids),
+            ",".join(batch_ids),
+        )
+        child_env = os.environ.copy()
+        child_env["WSJ_SEGMENTED_CHILD"] = "1"
+        child_env["LLM_COMPILE_WORKERS"] = "1"
+        child_env["LLM_MAX_PENDING"] = "1"
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--repair-missing-translations",
+            "--article-ids",
+            ",".join(batch_ids),
+        ]
+        if issue_date:
+            cmd.extend(["--date", issue_date])
+        result = subprocess.run(cmd, env=child_env, check=False)
+        gc.collect()
+
+        after_pending = set(_repair_target_article_ids(issue_date, article_ids))
+        advanced = len(before_pending) - len(after_pending)
+        if advanced > 0:
+            repaired_total += advanced
+        failed_batch_ids = [article_id for article_id in batch_ids if article_id in after_pending]
+        if result.returncode != 0 and failed_batch_ids:
+            raise RuntimeError(
+                "[repair] 分段修复子进程失败且仍有缺口: "
+                f"rc={result.returncode}, ids={','.join(failed_batch_ids)}"
+            )
+        if advanced <= 0 and failed_batch_ids:
+            raise RuntimeError(
+                "[repair] 分段修复没有减少缺口，停止避免空转: "
+                f"ids={','.join(failed_batch_ids)}"
+            )
+
+    raise RuntimeError(f"[repair] 分段修复超过最大轮数 {max_rounds}，停止避免空转")
 
 
 def refresh_image_captions(
@@ -4090,6 +4515,7 @@ def _persist_wsj_state(
     cfg: dict[str, Any],
     articles: list[dict[str, Any]],
     *,
+    issue_date: str | None = None,
     issue_covers: dict[str, str] | None = None,
     issue_pages: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
@@ -4097,10 +4523,12 @@ def _persist_wsj_state(
     _sync_paper_outputs(
         cfg,
         articles,
+        issue_date=issue_date,
         issue_covers=issue_covers,
         issue_pages=issue_pages,
     )
-    _maybe_rebuild_index(cfg)
+    if issue_date is None:
+        _maybe_rebuild_index(cfg)
 
 
 def regroup_archives_for_timezone(cfg: dict[str, Any], timezone_name: str) -> int:
@@ -4143,6 +4571,7 @@ def process_wsj(
     issue_date: str | None = None,
     dry_run: bool = False,
     limit: int = 0,
+    segment_size: int = 0,
 ) -> list[dict[str, Any]]:
     browser_cfg = cfg["browser"]
     page = open_browser(browser_cfg["user_data_path"], bool(browser_cfg.get("headless", False)))
@@ -4158,25 +4587,12 @@ def process_wsj(
         cover_url = adapter.first_page_cover_url()
         fetched_articles, pages = adapter.fetch_issue()
         existing = read_database_js()
-        existing_source_ids = {
-            str(article.get("source_id") or "").strip()
-            for article in existing
-            if str(article.get("source_id") or "").strip()
-        }
-        existing_title_keys = {
-            (
-                str(article.get("issue_date") or ""),
-                re.sub(r"[^a-z0-9]+", " ", str(article.get("title") or "").lower()).strip(),
-            )
-            for article in existing
-            if str(article.get("issue_date") or "") and str(article.get("title") or "").strip()
-        }
+        existing_source_ids, existing_title_keys = _existing_archive_keys(existing)
 
         def already_archived(article: EReaderArticle) -> bool:
-            title_key = re.sub(r"[^a-z0-9]+", " ", article.title.lower()).strip()
             return (
                 article.source_id in existing_source_ids
-                or (article.issue_date, title_key) in existing_title_keys
+                or (article.issue_date, _normalized_title_key(article.title)) in existing_title_keys
             )
 
         pending_articles = [article for article in fetched_articles if not already_archived(article)]
@@ -4211,6 +4627,29 @@ def process_wsj(
         if not str(cfg["llm"].get("api_key") or "").strip():
             raise RuntimeError("LLM_API_KEY 未配置，无法执行翻译、中文解读和 glossary")
 
+        if limit <= 0 and segment_size > 0 and os.environ.get("WSJ_SEGMENTED_CHILD") != "1":
+            manifest_path = _write_wsj_segment_manifest(
+                selected_date=selected_date,
+                cover_image=cover_image,
+                pages=pages,
+                articles=pending_articles,
+            )
+            log.info(
+                "已写入 WSJ 分段 manifest: %s，本次将按每段 %d 篇编译",
+                manifest_path,
+                segment_size,
+            )
+            save_wsj_cookies(page, cookie_path)
+            try:
+                page.close()
+            except Exception:
+                pass
+            page = None
+            del fetched_articles, pending_articles, pages, existing
+            gc.collect()
+            _run_wsj_manifest_segments(cfg, manifest_path, segment_size=segment_size)
+            return []
+
         compile_workers = max(1, int(cfg["pipeline"].get("compile_workers", 2)))
         max_pending = max(compile_workers, int(cfg["pipeline"].get("max_pending", 4)))
         new_articles: list[dict[str, Any]] = []
@@ -4226,10 +4665,11 @@ def process_wsj(
                 _persist_wsj_state(
                     cfg,
                     existing,
+                    issue_date=selected_date,
                     issue_covers=issue_covers,
                     issue_pages=issue_pages,
                 )
-                log.info("已收录并更新根库、每日库和索引: %s - %s", article["id"], article["title"][:80])
+                log.info("已收录并更新根库、每日库和轻量索引: %s - %s", article["id"], article["title"][:80])
 
             def drain_compiled(block: bool) -> None:
                 if not pending_compile:
@@ -4305,10 +4745,11 @@ def process_wsj(
         save_wsj_cookies(page, cookie_path)
         return new_articles
     finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 def login_wsj(cfg: dict[str, Any], issue_date: str | None = None) -> bool:
@@ -4366,13 +4807,21 @@ def parse_args() -> argparse.Namespace:
                    help="启动前杀掉残留 Chrome 进程 + 删 lock 文件(默认也会自动做一次)")
     p.add_argument("--rebuild-outputs", action="store_true",
                    help="根据根 database.js 重建每日 database.js 和 database_index.js")
+    p.add_argument("--segment-size", type=int, default=None,
+                   help="全量抓取时按 N 篇一个子进程分段编译(0=关闭；默认读 WSJ_SEGMENT_SIZE)")
+    p.add_argument("--repair-batch-size", type=int, default=None,
+                   help="修复缺失译文时按 N 篇一个子进程分段执行(0=关闭；默认读 WSJ_REPAIR_BATCH_SIZE)")
+    p.add_argument("--compile-manifest", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--manifest-batch-size", type=int, default=1,
+                   help=argparse.SUPPRESS)
     return p.parse_args()
 
 
 def main() -> int:
     global DATABASE_JS
-    run_lock = acquire_run_lock()
     args = parse_args()
+    run_lock = None if os.environ.get("WSJ_SEGMENTED_CHILD") == "1" else acquire_run_lock()
     cfg = load_config()
     configured_database = str(cfg.get("paths", {}).get("database_js") or "").strip()
     if configured_database:
@@ -4396,15 +4845,42 @@ def main() -> int:
         return 0
     if args.repair_missing_translations:
         article_ids = {item.strip() for item in args.article_ids.split(",") if item.strip()}
-        repair_missing_translations(cfg, issue_date, article_ids)
+        repair_batch_size = (
+            max(0, int(args.repair_batch_size))
+            if args.repair_batch_size is not None
+            else max(0, int(cfg.get("pipeline", {}).get("repair_batch_size", 0)))
+        )
+        if repair_batch_size > 0 and os.environ.get("WSJ_SEGMENTED_CHILD") != "1":
+            _run_repair_segments(
+                cfg,
+                issue_date=issue_date,
+                article_ids=article_ids,
+                batch_size=repair_batch_size,
+            )
+        else:
+            repair_missing_translations(cfg, issue_date, article_ids)
         return 0
+    if hasattr(args, "compile_manifest"):
+        _compile_wsj_manifest_batch(
+            cfg,
+            Path(args.compile_manifest).expanduser(),
+            batch_size=max(1, int(args.manifest_batch_size)),
+        )
+        return 0
+    segment_size = (
+        max(0, int(args.segment_size))
+        if args.segment_size is not None
+        else max(0, int(cfg.get("pipeline", {}).get("segment_size", 0)))
+    )
     process_wsj(
         cfg,
         issue_date=issue_date,
         dry_run=args.dry_run,
         limit=max(0, args.limit),
+        segment_size=segment_size,
     )
-    run_lock.close()
+    if run_lock is not None:
+        run_lock.close()
     return 0
 
 
