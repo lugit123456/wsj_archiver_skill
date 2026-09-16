@@ -2306,9 +2306,10 @@ def _wsj_text_cover_url(graph_url: str) -> str:
     """Return the high-resolution transparent text layer matching graph1024."""
     parsed = urlparse(str(graph_url or "").strip())
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    if query.get("type") != "graph1024":
+    image_type = query.get("type")
+    if image_type not in {"graph1024", "graph"}:
         return ""
-    query["type"] = "text1024"
+    query["type"] = "text1024" if image_type == "graph1024" else "text"
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 

@@ -543,7 +543,7 @@ class WsjEReaderAdapter:
             expected_issue = self.issue_date.replace("-", "")
             if query.get("issue", [""])[0] != expected_issue:
                 return ""
-            if query.get("type", [""])[0] != "graph1024":
+            if query.get("type", [""])[0] not in {"graph1024", "graph"}:
                 return ""
             return value
 
