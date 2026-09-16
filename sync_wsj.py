@@ -726,6 +726,7 @@ def _write_atomic_text(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
+        os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, path)
     except Exception:
         if os.path.exists(tmp_path):
@@ -742,6 +743,7 @@ def _write_atomic_bytes(path: Path, data: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
+        os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, path)
     except Exception:
         if os.path.exists(tmp_path):
@@ -760,6 +762,173 @@ def _build_issue_glossary(articles: list[dict[str, Any]]) -> dict[str, dict[str,
             if glossary_id:
                 glossary[glossary_id] = dict(entry)
     return glossary
+
+
+def _read_paper_issue_payload(database_path: Path) -> dict[str, Any] | None:
+    try:
+        previous = database_path.read_text(encoding="utf-8")
+        payload_match = re.search(
+            r"window\.paper_databases\[[^\]]+\]\s*=\s*(\{.*\})\s*;\s*$",
+            previous,
+            re.DOTALL,
+        )
+        if not payload_match:
+            return None
+        payload = json.loads(payload_match.group(1))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _paper_cover_exists(output_root: Path, issue_date: str, cover_image: str) -> bool:
+    cover_image = str(cover_image or "").strip()
+    if not cover_image:
+        return False
+    if re.match(r"^[a-z][a-z0-9+.-]*:", cover_image, flags=re.I):
+        return True
+    cover_path = output_root / PAPER_PUBLICATION_TYPE / issue_date / cover_image
+    return cover_path.is_file() and cover_path.stat().st_size > 0
+
+
+def _fallback_cover_jpeg(
+    issue_date: str,
+    article: dict[str, Any],
+    image_path: Path,
+) -> bytes:
+    """Create a newspaper-like fallback cover when the full eReader page is unavailable."""
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
+    width, height = 1506, 3016
+    margin = 110
+    canvas = Image.new("RGB", (width, height), "#f7f2e8")
+    draw = ImageDraw.Draw(canvas)
+
+    def font(size: int) -> Any:
+        for candidate in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+        ):
+            try:
+                return ImageFont.truetype(candidate, size=size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    masthead = font(108)
+    headline_font = font(66)
+    body_font = font(42)
+    small_font = font(32)
+
+    draw.rectangle((0, 0, width, height), fill="#f7f2e8")
+    draw.text((margin, 90), "THE WALL STREET JOURNAL.", fill="#111111", font=masthead)
+    draw.line((margin, 230, width - margin, 230), fill="#111111", width=5)
+    draw.text((margin, 260), issue_date, fill="#333333", font=small_font)
+
+    y = 335
+    title = str(article.get("title") or "The Wall Street Journal").strip()
+    words = title.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if draw.textlength(candidate, font=headline_font) <= width - margin * 2:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    for line in lines[:4]:
+        draw.text((margin, y), line, fill="#111111", font=headline_font)
+        y += 84
+
+    byline = str(article.get("byline") or article.get("section") or "").strip()
+    if byline:
+        draw.text((margin, y + 10), byline[:90], fill="#555555", font=small_font)
+        y += 70
+
+    try:
+        with Image.open(image_path) as source:
+            source = source.convert("RGB")
+            image_box = (margin, y + 40, width - margin, min(height - 540, y + 1120))
+            box_w = image_box[2] - image_box[0]
+            box_h = image_box[3] - image_box[1]
+            source.thumbnail((box_w, box_h), Image.Resampling.LANCZOS)
+            x = image_box[0] + (box_w - source.width) // 2
+            canvas.paste(source, (x, image_box[1]))
+            y = image_box[1] + source.height + 70
+    except Exception:
+        y += 60
+
+    draw.line((margin, y, width - margin, y), fill="#333333", width=2)
+    y += 45
+    for item in article.get("paragraphs") or []:
+        text = str(item.get("text") or item.get("en_text") or item.get("en_html") or "").strip()
+        if text:
+            teaser = text
+            break
+    else:
+        teaser = str(article.get("content_raw") or article.get("content_markdown") or "").strip()
+    teaser_words = teaser.split()
+    current = ""
+    for word in teaser_words:
+        candidate = f"{current} {word}".strip()
+        if draw.textlength(candidate, font=body_font) <= width - margin * 2:
+            current = candidate
+        else:
+            draw.text((margin, y), current, fill="#222222", font=body_font)
+            y += 60
+            current = word
+        if y > height - 300:
+            break
+    if current and y <= height - 300:
+        draw.text((margin, y), current, fill="#222222", font=body_font)
+
+    output = BytesIO()
+    canvas.save(output, format="JPEG", quality=90, optimize=True)
+    return output.getvalue()
+
+
+def _fallback_issue_cover_from_article_images(
+    output_root: Path,
+    issue_date: str,
+    articles: list[dict[str, Any]],
+) -> str:
+    """Use the first available article image when the eReader page cover times out."""
+    issue_dir = output_root / PAPER_PUBLICATION_TYPE / issue_date
+    cover_path = issue_dir / "cover.jpg"
+    if cover_path.exists() and cover_path.stat().st_size > 0:
+        return cover_path.name
+
+    candidate_articles = list(articles)
+    if not any(article.get("images") for article in candidate_articles):
+        payload = _read_paper_issue_payload(issue_dir / "database.js")
+        if payload and isinstance(payload.get("articles"), list):
+            candidate_articles.extend(
+                article for article in payload["articles"]
+                if isinstance(article, dict)
+            )
+
+    for article in candidate_articles:
+        for image_path in article.get("images") or []:
+            relative = str(image_path or "").strip()
+            if not relative.startswith("images/"):
+                continue
+            source = issue_dir / relative
+            if not source.is_file() or source.stat().st_size <= 1024:
+                continue
+            try:
+                _write_atomic_bytes(
+                    cover_path,
+                    _fallback_cover_jpeg(issue_date, article, source),
+                )
+            except Exception:
+                shutil.copy2(source, cover_path)
+            log.warning("[ereader] 未获取到版面封面，已使用文章图片兜底: %s", relative)
+            return cover_path.name
+    return ""
 
 
 def _write_paper_issue_database(
@@ -790,17 +959,22 @@ def _write_paper_issue_database(
             if not cover_image:
                 matched = re.search(r'"cover_image"\s*:\s*"([^"]*)"', previous)
                 cover_image = matched.group(1) if matched else ""
-            payload_match = re.search(
-                r"window\.paper_databases\[[^\]]+\]\s*=\s*(\{.*\})\s*;\s*$",
-                previous,
-                re.DOTALL,
-            )
-            if payload_match:
-                old_payload = json.loads(payload_match.group(1))
-                if isinstance(old_payload.get("pages"), list):
-                    previous_pages = old_payload["pages"]
+            old_payload = _read_paper_issue_payload(database_path)
+            if old_payload and isinstance(old_payload.get("pages"), list):
+                previous_pages = old_payload["pages"]
         except Exception:
             pass
+
+    if cover_image and not _paper_cover_exists(output_root, issue_date, cover_image):
+        log.warning("[ereader] 既有封面引用无效，将重新生成兜底封面: %s", cover_image)
+        cover_image = ""
+
+    if not cover_image:
+        cover_image = _fallback_issue_cover_from_article_images(
+            output_root,
+            issue_date,
+            normalized_articles,
+        )
 
     page_rows = pages if pages is not None else previous_pages
     if not page_rows:
